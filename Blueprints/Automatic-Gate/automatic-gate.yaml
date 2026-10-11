@@ -4361,25 +4361,26 @@ actions:
                               {% set data = namespace(drivers_near_gate=[]) %}
                               {% for sensor_idx in range(itinerary_sensors | length) %}
                                 {% if sensor_idx != idx %}
-                                  {%
-                                    set value = (
-                                      states(
-                                        itinerary_sensors[sensor_idx]
-                                      )
-                                      | from_json(default_itinerary_sensor_value)
-                                    )
-                                  %}
-                                  {% if value.status in ['on_approach', 'leaving'] %}
-                                    {% if sensor_idx < persons | length %}
-                                      {% set name_sensor = persons[sensor_idx] %}
-                                    {% else %}
-                                      {% set name_sensor = itinerary_sensors[sensor_idx] %}
-                                    {% endif %}
-                                    {%
-                                      set data.drivers_near_gate = data.drivers_near_gate + [
-                                        state_attr(name_sensor, 'friendly_name')
-                                      ]
-                                    %}
+                                  {% set value = states(itinerary_sensors[sensor_idx]) | from_json(default_itinerary_sensor_value) %}
+                                  {% set is_arriving = value.status == 'on_approach'
+                                    and (sensor_idx >= persons | length
+                                      or states(persons[sensor_idx]) in ['unknown', 'unavailable']
+                                      or state_attr(persons[sensor_idx], 'latitude') is none
+                                      or state_attr(persons[sensor_idx], 'longitude') is none
+                                      or distance(persons[sensor_idx], gate_location) * 1000
+                                        - (state_attr(persons[sensor_idx], 'gps_accuracy') | float(100)) < activation_zone) %}
+                                  {% set is_leaving_and_still_near = false %}
+                                  {% if value.status == 'leaving' and sensor_idx < persons | length %}
+                                    {% set other_driver = persons[sensor_idx] %}
+                                    {% set accuracy = state_attr(other_driver, 'gps_accuracy') | float(100) %}
+                                    {% set is_leaving_and_still_near =
+                                      distance(other_driver, gate_location) * 1000 - accuracy < activation_zone %}
+                                  {% endif %}
+                                  {% if is_arriving or is_leaving_and_still_near %}
+                                    {% set name_sensor = persons[sensor_idx] if sensor_idx < persons | length
+                                      else itinerary_sensors[sensor_idx] %}
+                                    {% set data.drivers_near_gate =
+                                      data.drivers_near_gate + [state_attr(name_sensor, 'friendly_name')] %}
                                   {% endif %}
                                 {% endif %}
                               {% endfor %}
@@ -4427,6 +4428,68 @@ actions:
                                 - alias: Manual closing
                                   trigger: template
                                   value_template: *all_gates_closed
+                              timeout:
+                                minutes: !input timeout_delay
+                              continue_on_timeout: true
+                            - alias: On timeout, re-check nearby drivers before closing
+                              if:
+                                - condition: template
+                                  value_template: "{{ not wait.completed }}"
+                              then:
+                                - alias: Recompute drivers near gate after timeout
+                                  variables:
+                                    drivers_near_gate: >-
+                                    {% set data = namespace(drivers_near_gate=[]) %}
+                                    {% for sensor_idx in range(itinerary_sensors | length) %}
+                                      {% if sensor_idx != idx %}
+                                        {% set value = states(itinerary_sensors[sensor_idx]) | from_json(default_itinerary_sensor_value) %}
+                                        {% set is_arriving = value.status == 'on_approach'
+                                          and (sensor_idx >= persons | length
+                                            or states(persons[sensor_idx]) in ['unknown', 'unavailable']
+                                            or state_attr(persons[sensor_idx], 'latitude') is none
+                                            or state_attr(persons[sensor_idx], 'longitude') is none
+                                            or distance(persons[sensor_idx], gate_location) * 1000
+                                              - (state_attr(persons[sensor_idx], 'gps_accuracy') | float(100)) < activation_zone) %}
+                                        {% set is_leaving_and_still_near = false %}
+                                        {% if value.status == 'leaving' and sensor_idx < persons | length %}
+                                          {% set other_driver = persons[sensor_idx] %}
+                                          {% set accuracy = state_attr(other_driver, 'gps_accuracy') | float(100) %}
+                                          {% set is_leaving_and_still_near =
+                                            distance(other_driver, gate_location) * 1000 - accuracy < activation_zone %}
+                                        {% endif %}
+                                        {% if is_arriving or is_leaving_and_still_near %}
+                                          {% set name_sensor = persons[sensor_idx] if sensor_idx < persons | length
+                                            else itinerary_sensors[sensor_idx] %}
+                                          {% set data.drivers_near_gate =
+                                            data.drivers_near_gate + [state_attr(name_sensor, 'friendly_name')] %}
+                                        {% endif %}
+                                      {% endif %}
+                                    {% endfor %}
+                                    {{ data.drivers_near_gate }}
+                                - alias: Close all gates only if nobody remains near
+                                  if:
+                                    - condition: template
+                                      value_template: "{{ drivers_near_gate == [] }}"
+                                    - condition: template
+                                      value_template: *gate_open
+                                  then:
+                                    - alias: Close all gates
+                                      repeat:
+                                        for_each: >-
+                                          {{
+                                            gate
+                                            | select('is_state', ['on', 'open', 'opening'])
+                                            | list
+                                          }}
+                                        sequence:
+                                          - action: >-
+                                              {% if states[repeat.item].domain == 'switch' %}
+                                                switch.turn_off
+                                              {% elif states[repeat.item].domain == 'cover' %}
+                                                cover.close_cover
+                                              {% endif %}
+                                            target:
+                                              entity_id: "{{ repeat.item }}"
                             - alias: If a notify service exists
                               if:
                                 - condition: template
